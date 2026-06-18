@@ -1,1 +1,5 @@
-# Demo apps (chat_server, chat_client) land in Phase 6 once socket_api exists.
+add_executable(chat_server chat_server.cpp)
+target_link_libraries(chat_server PRIVATE minitcp_core)
+
+add_executable(chat_client chat_client.cpp)
+target_link_libraries(chat_client PRIVATE minitcp_core)

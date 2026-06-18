@@ -20,6 +20,9 @@ add_library(minitcp_core
     src/ip.cpp
     src/icmp.cpp
     src/udp.cpp
+    src/tcp.cpp
+    src/dispatch.cpp
+    src/socket_api.cpp
 )
 target_include_directories(minitcp_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 

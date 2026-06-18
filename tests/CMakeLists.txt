@@ -2,4 +2,10 @@ add_executable(checksum_test checksum_test.cpp)
 target_link_libraries(checksum_test PRIVATE minitcp_core)
 add_test(NAME checksum_test COMMAND checksum_test)
 
-# tcp_state_test and retransmission_test land in Phase 4/5 once tcp.cpp exists.
+add_executable(tcp_state_test tcp_state_test.cpp)
+target_link_libraries(tcp_state_test PRIVATE minitcp_core)
+add_test(NAME tcp_state_test COMMAND tcp_state_test)
+
+add_executable(retransmission_test retransmission_test.cpp)
+target_link_libraries(retransmission_test PRIVATE minitcp_core)
+add_test(NAME retransmission_test COMMAND retransmission_test)
