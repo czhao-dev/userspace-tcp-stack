@@ -1,0 +1,16 @@
+services:
+  minitcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: minitcp-dev
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - .:/minitcp
+    working_dir: /minitcp
+    stdin_open: true
+    tty: true
+    command: ["/bin/bash"]
