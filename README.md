@@ -24,19 +24,18 @@ IP packets directly through a TUN device. The kernel hands MiniTCP raw IP
 packets; everything above that — header parsing, checksums, the ICMP echo
 protocol, UDP, and the full TCP connection lifecycle — is implemented by hand.
 
-This is the same class of work done by network driver teams, NIC vendors
-(Mellanox/NVIDIA, Broadcom), and embedded systems teams implementing
-lightweight stacks (lwIP, picoTCP) for resource-constrained devices. It
-demonstrates what actually happens between a `connect()` call and bytes
-arriving in order on the other end — knowledge that is increasingly rare as
-most engineers only ever interact with sockets through a high-level API.
+The project is intentionally small enough to inspect end to end while still
+behaving like a real network endpoint. A `connect()` from `curl` or `netcat`
+turns into raw TCP segments on the TUN device; MiniTCP parses those packets,
+updates protocol state, generates replies, retransmits lost data, and delivers
+application bytes in order.
 
-There is also a direct line back to EDA and digital design: the TCP state
-machine — `LISTEN`, `SYN_RCVD`, `ESTABLISHED`, `FIN_WAIT`, `CLOSED`, and the
-transitions between them — is a finite state machine in the same formal sense
-as the FSMs verified in RTL. Implementing TCP's state machine by hand and
-reasoning about every transition (including the simultaneous-close edge
-case) is, in a real sense, protocol verification work.
+The TCP implementation is centered on an explicit finite state machine:
+`LISTEN`, `SYN_RCVD`, `ESTABLISHED`, `FIN_WAIT`, `TIME_WAIT`, `CLOSED`, and
+the other RFC-defined states are represented directly in code. Each transition
+is driven by incoming segment flags, local API calls, retransmission timers, or
+connection teardown events, including less common cases such as simultaneous
+close and FIN retransmission while in `TIME_WAIT`.
 
 ---
 
@@ -93,8 +92,7 @@ listener serves both `nc` chat sessions and `curl`.
 
 ## TCP State Machine
 
-This is the diagram you should be able to redraw from memory in an
-interview — it is the core of the project. See
+This is the core TCP lifecycle implemented by MiniTCP. See
 [docs/state_machine.md](docs/state_machine.md) for an annotated version with
 the RFC section and implementing function for every transition.
 
@@ -397,49 +395,28 @@ MiniTCP's own code.
 
 ---
 
-## How to Talk About This Project in an Interview
+## Implementation Notes
 
-**What is the project?**
-"I implemented a TCP/IP stack from scratch in user space, reading and
-writing raw IP packets through a Linux TUN interface. It handles ICMP, UDP,
-and a full TCP connection — handshake, data transfer, retransmission on
-loss, and graceful teardown in both directions — and it's interoperable
-with real tools, so I can run `curl` or `netcat` against my own
-implementation and get a correct response. I also bridged two TUN devices
-through the kernel's own routing so two separate instances of my stack
-could talk to each other directly."
+MiniTCP handles TCP reliability with a deliberately simple retransmission
+model: each connection tracks unacknowledged segments and uses a single
+per-connection retransmission timer with exponential backoff. This keeps the
+mechanism compact while still exercising the core behavior required for data
+delivery over a lossy link.
 
-**Walk me through the TCP state machine.**
-"A connection starts in `LISTEN`. On receiving a `SYN`, it moves to
-`SYN_RCVD` and replies with `SYN,ACK`. On receiving the final `ACK`, it
-reaches `ESTABLISHED`, where data transfer happens. Closing is more involved
-— calling close sends a `FIN` and moves to `FIN_WAIT_1`, and depending on
-whether the remote side acknowledges first or sends its own `FIN` first, you
-go through different paths — `FIN_WAIT_2` then `TIME_WAIT`, or `CLOSING`
-then `TIME_WAIT`. I hit a real bug here during testing: my first
-implementation just ignored any segment received in `TIME_WAIT`, which
-meant a lost final ACK caused the other side to retransmit its FIN forever
-since nobody ever re-acked it. `TIME_WAIT`'s whole purpose is to catch
-exactly that case."
+Out-of-order data is buffered until the missing sequence range arrives, then
+spliced back into the receive stream before being exposed through
+`minitcp_recv`. The `tcp_state_test` covers this by delivering three data
+segments in the order `C, A, B` and verifying that the application receives
+the original byte stream.
 
-**What was the hardest part?**
-"Reliability under packet loss. The handshake is straightforward once you
-have the state machine; the harder problem is correctly tracking
-unacknowledged segments, retransmitting them with the right backoff, and
-handling segments that arrive out of order without either losing data or
-delivering it in the wrong order. I tested this with a harness that
-connects two real TCP endpoints over a simulated lossy link and runs the
-full handshake-through-teardown sequence at 0/10/30% loss — that test (and
-manually testing the two-TUN-device chat demo) caught the `TIME_WAIT` bug
-above, which a single-host, no-loss test never would have."
+Connection teardown is implemented as separate local-close and remote-close
+paths. `TIME_WAIT` also re-ACKs retransmitted FINs, which is necessary when
+the final ACK is lost and the peer retries its FIN.
 
-**What would you do next?**
-"Selective acknowledgment (`SACK`) would make retransmission far more
-efficient than my current go-back-N-style behavior, and a real congestion
-control algorithm — Reno or Cubic — would be the natural extension beyond
-the slow start I deliberately scoped out (noted in `docs/state_machine.md`).
-Beyond TCP itself, the same TUN-based approach extends naturally to IPv6 or
-to experimenting with a custom transport protocol."
+Selective acknowledgment (`SACK`) and full congestion control are natural
+future extensions. The current implementation focuses on correctness of the
+core connection lifecycle, retransmission, in-order delivery, and
+interoperability with real Linux networking tools.
 
 ---
 
