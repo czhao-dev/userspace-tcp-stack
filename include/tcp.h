@@ -107,7 +107,13 @@ struct TCPConnection {
 
     std::chrono::steady_clock::time_point time_wait_deadline;
 
-    static constexpr size_t kRecvBufferCap = 65536;
+    // Defaults match the stack's original hardcoded limits; tunable
+    // per-connection via SO_RCVBUF/SO_SNDBUF (see socket_api.h).
+    static constexpr size_t kDefaultRecvBufferCap = 65536;
+    static constexpr size_t kDefaultSendBufferCap = 1u << 20;
+
+    size_t recv_buffer_cap = kDefaultRecvBufferCap;
+    size_t send_pending_cap = kDefaultSendBufferCap;
 };
 
 using TCPConnPtr = std::shared_ptr<TCPConnection>;
@@ -128,8 +134,13 @@ void tcp_tick(int tun_fd, bool trace);
 TCPConnPtr tcp_create();
 
 // Marks (local_addr, local_port) as listening; completed connections
-// arriving on it become available via tcp_accept().
-void tcp_listen(uint32_t local_addr, uint16_t local_port);
+// arriving on it become available via tcp_accept(). Returns false
+// without changing any state if that exact (local_addr, local_port)
+// is occupied by a live (non-CLOSED) connection — or, unless
+// `reuse_addr` is set, one sitting in TIME_WAIT. Re-issuing
+// tcp_listen() on a port already in LISTEN is always a no-op success,
+// since there is no connection there to conflict with.
+bool tcp_listen(uint32_t local_addr, uint16_t local_port, bool reuse_addr = false);
 
 // Pops one ESTABLISHED, not-yet-accepted connection for the given
 // listening (local_addr, local_port), or nullptr if none is ready.

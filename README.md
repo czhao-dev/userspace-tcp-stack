@@ -4,7 +4,7 @@
 [![CMake](https://img.shields.io/badge/build-CMake%203.20%2B-064F8C?logo=cmake&logoColor=white)](https://cmake.org/)
 [![Docker](https://img.shields.io/badge/dev%20env-Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20TUN-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
-[![Tests](https://img.shields.io/badge/tests-3%2F3%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-5%2F5%20passing-brightgreen)](#test-results)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 > A TCP/IP protocol stack implemented entirely in user space over a Linux TUN
@@ -53,8 +53,10 @@ reply.
 
 **UDP** — `include/udp.h`, `src/udp.cpp`
 Parses and constructs UDP headers (source port, destination port, length,
-checksum, including the 12-byte pseudo-header) and echoes datagrams back to
-the sender.
+checksum, including the 12-byte pseudo-header). A datagram is delivered to
+an application socket if one is bound to its destination `(address, port)`;
+otherwise it's echoed back to the sender, exactly as before the socket-level
+UDP API existed.
 
 **TCP** — `include/tcp.h`, `src/tcp.cpp` (the centerpiece)
 
@@ -78,10 +80,23 @@ Slow-start congestion control was scoped out — see
 for why.
 
 **Socket-like API** — `include/socket_api.h`, `src/socket_api.cpp`
-`minitcp_socket`, `minitcp_listen`, `minitcp_accept`, `minitcp_connect`,
-`minitcp_send`, `minitcp_recv`, `minitcp_close` — a small wrapper so
-application code looks like BSD sockets and never touches `TCPConnection`/
-`TCPState` directly. Used by both demo apps below.
+A small wrapper so application code looks like BSD sockets and never
+touches `TCPConnection`/`TCPState`/`UDPSocket` directly:
+
+- TCP: `minitcp_socket`, `minitcp_listen`, `minitcp_accept`, `minitcp_connect`,
+  `minitcp_send`, `minitcp_recv`, `minitcp_close`. Used by both demo apps
+  below.
+- UDP: `minitcp_udp_socket`, `minitcp_bind`, `minitcp_sendto`,
+  `minitcp_recvfrom`, addressed with the real POSIX `struct sockaddr_in`
+  rather than a custom type.
+- Socket options: `minitcp_setsockopt`/`minitcp_getsockopt` mirror POSIX's
+  signature and reuse its `SOL_SOCKET`/`SO_*` constants. Four are wired up
+  to real, observable behavior rather than just stored — `SO_RCVTIMEO`
+  makes `recv`/`recvfrom`/`accept` actually stop blocking, `SO_REUSEADDR`
+  lets `listen()` bypass a port still occupied by a connection in
+  `TIME_WAIT`, and `SO_RCVBUF`/`SO_SNDBUF` tune the per-socket buffer caps.
+  All four are opt-in and don't change the behavior of any call site that
+  doesn't use them.
 
 **Demo apps** — `apps/chat_server.cpp`, `apps/chat_client.cpp`
 A minimal chat server/client built only on the socket API. The server also
@@ -148,13 +163,15 @@ the RFC section and implementing function for every transition.
 Application (chat client/server, or a manual test harness)
         │
         ▼
- Socket-like API     minitcp_connect / listen / accept / send / recv
+ Socket-like API     TCP: connect/listen/accept/send/recv
+                     UDP: bind/sendto/recvfrom (sockaddr_in, setsockopt)
         │
         ▼
  TCP                 state machine, sliding window, retransmission
         │
         ▼
- UDP / ICMP           connectionless protocols, simpler to implement first
+ UDP / ICMP           UDP: deliver to a bound socket, else auto-echo
+                      ICMP: echo reply
         │
         ▼
  IP                  header parse/construct, checksum, routing decision
@@ -234,18 +251,22 @@ hello
 
 ## Test Results
 
-Three test binaries, run via `ctest`:
+Five test binaries, run via `ctest`:
 
 ```
 Test project /minitcp/build
     Start 1: checksum_test
-1/3 Test #1: checksum_test ....................   Passed    0.00 sec
+1/5 Test #1: checksum_test ....................   Passed    0.00 sec
     Start 2: tcp_state_test
-2/3 Test #2: tcp_state_test ...................   Passed    0.00 sec
+2/5 Test #2: tcp_state_test ...................   Passed    0.00 sec
     Start 3: retransmission_test
-3/3 Test #3: retransmission_test ..............   Passed   13.10 sec
+3/5 Test #3: retransmission_test ..............   Passed   13.10 sec
+    Start 4: udp_socket_test
+4/5 Test #4: udp_socket_test ..................   Passed    0.00 sec
+    Start 5: sockopt_test
+5/5 Test #5: sockopt_test .....................   Passed    0.21 sec
 
-100% tests passed, 0 tests failed out of 3
+100% tests passed, 0 tests failed out of 5
 ```
 
 - **`checksum_test`** — the RFC 1071 worked example, a build/verify
@@ -270,6 +291,19 @@ Test project /minitcp/build
   teardown sequence correctly regardless of loss rate — just with more
   retransmissions logged at higher loss.
 
+- **`udp_socket_test`** — drives `udp.h`/`tcp.h` directly (no TUN device):
+  a `sendto`/`recvfrom`-style round trip through a bound `UDPSocket`, a
+  datagram dropped when it would exceed the `SO_RCVBUF` cap, the auto-echo
+  fallback still firing when nothing is bound to a port, and the
+  `SO_REUSEADDR` guard in `tcp_listen` — blocked by a connection sitting in
+  `TIME_WAIT`, then allowed through once `reuse_addr` is set.
+- **`sockopt_test`** — exercises `minitcp_setsockopt`/`getsockopt` end to
+  end against a real (in-process) blocking call, using `minitcp_init_with_fd()`
+  with a `socketpair` standing in for the TUN device: `SO_RCVTIMEO` actually
+  causes an idle `minitcp_recvfrom()` to return a timeout instead of
+  blocking forever, and `SO_REUSEADDR`/`SO_RCVBUF`/`SO_SNDBUF` round-trip
+  correctly through `getsockopt`.
+
 **Manually verified against real, unmodified tools** (see
 [Build & Run](#build--run) for the exact commands):
 
@@ -280,6 +314,8 @@ Test project /minitcp/build
 | TCP handshake + chat, remote-initiated close | `nc 10.0.0.2 8080` | `SYN→SYN,ACK→ACK→ESTABLISHED`, data echoed, clean `FIN→CLOSE_WAIT→LAST_ACK→CLOSED` |
 | TCP + HTTP, local-initiated close | `curl http://10.0.0.2:8080/` | correct `200 OK`, clean `FIN_WAIT_1→FIN_WAIT_2→TIME_WAIT→CLOSED` |
 | MiniTCP talking to MiniTCP | `chat_client` ↔ `chat_server` on separate TUN devices, bridged by real kernel IP forwarding | full two-party conversation over our own TCP implementation on both ends |
+| UDP socket API | a small program using `minitcp_udp_socket`/`bind`/`recvfrom`/`sendto`, exercised with `nc -u 10.0.0.2 <port>` | bound port: trace shows `deliver -> bound app socket`, the app echoes the datagram; a *different*, unbound port still auto-echoes as before |
+| `SO_RCVTIMEO` | the same program, left idle with a 1s receive timeout set | `minitcp_recvfrom` returns the timeout sentinel once a second instead of blocking forever |
 
 ---
 
@@ -314,7 +350,9 @@ minitcp/
 ├── tests/
 │   ├── checksum_test.cpp
 │   ├── tcp_state_test.cpp              ← drive the state machine with crafted segments
-│   └── retransmission_test.cpp           ← simulate packet loss, verify retry + backoff
+│   ├── retransmission_test.cpp           ← simulate packet loss, verify retry + backoff
+│   ├── udp_socket_test.cpp                 ← UDP bind/sendto/recvfrom, echo fallback, SO_REUSEADDR
+│   └── sockopt_test.cpp                      ← setsockopt/getsockopt, SO_RCVTIMEO actually timing out
 ├── scripts/
 │   ├── setup_tun.sh                       ← create tun0/tun1 with point-to-point addressing
 │   └── teardown_tun.sh
@@ -417,6 +455,18 @@ Selective acknowledgment (`SACK`) and full congestion control are natural
 future extensions. The current implementation focuses on correctness of the
 core connection lifecycle, retransmission, in-order delivery, and
 interoperability with real Linux networking tools.
+
+UDP's socket layer and the new socket options were added without changing
+any existing call site's behavior. `handle_udp()` only stops auto-echoing a
+port once an application explicitly binds a `UDPSocket` to it; nothing else
+observes the difference. Socket options are genuinely wired up rather than
+just stored: `SO_RCVTIMEO` bounds the same `pump_once()`-driven blocking
+loops that `minitcp_recv`/`minitcp_accept` always used, `SO_REUSEADDR`
+bypasses a real "address in use" check added to `tcp_listen()` for a port
+held by a connection in `TIME_WAIT`, and `SO_RCVBUF`/`SO_SNDBUF` resize the
+buffer caps that used to be fixed constants on `TCPConnection`. Because a
+fresh socket never touches these options, every existing demo app and test
+keeps its original behavior by default.
 
 ---
 

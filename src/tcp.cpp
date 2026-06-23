@@ -142,7 +142,7 @@ uint16_t allocate_ephemeral_port() {
 
 uint16_t advertise_window(const TCPConnPtr& conn) {
     size_t used = conn->recv_buffer.size();
-    size_t cap = TCPConnection::kRecvBufferCap;
+    size_t cap = conn->recv_buffer_cap;
     if (used >= cap) return 0;
     size_t avail = cap - used;
     return static_cast<uint16_t>(std::min<size_t>(avail, 65535));
@@ -602,8 +602,33 @@ TCPConnPtr tcp_create() {
     return std::make_shared<TCPConnection>();
 }
 
-void tcp_listen(uint32_t local_addr, uint16_t local_port) {
+namespace {
+
+// True if a new tcp_listen() on (addr, port) should be refused. A port
+// already in LISTEN is *not* a conflict (re-listening is a no-op
+// success) — only a live connection occupying that exact local
+// (addr, port) blocks a fresh listen, and a TIME_WAIT one only blocks
+// it when reuse_addr is false.
+bool address_in_use(uint32_t addr, uint16_t port, bool reuse_addr) {
+    if (g_listeners.count({addr, port})) return false;
+    for (const auto& entry : g_connections) {
+        const TCPConnPtr& c = entry.second;
+        if (c->local_addr != addr || c->local_port != port) continue;
+        if (c->state == TCPState::CLOSED) continue;
+        if (c->state == TCPState::TIME_WAIT && reuse_addr) continue;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool tcp_listen(uint32_t local_addr, uint16_t local_port, bool reuse_addr) {
+    if (address_in_use(local_addr, local_port, reuse_addr)) {
+        return false;
+    }
     g_listeners.insert({local_addr, local_port});
+    return true;
 }
 
 TCPConnPtr tcp_accept(uint32_t local_addr, uint16_t local_port) {
@@ -638,9 +663,13 @@ bool tcp_connect(TCPConnPtr conn, int tun_fd, uint32_t local_addr, uint32_t remo
 }
 
 size_t tcp_send(TCPConnPtr conn, int tun_fd, const uint8_t* data, size_t len, bool trace) {
-    conn->send_pending.insert(conn->send_pending.end(), data, data + len);
+    size_t room = conn->send_pending_cap > conn->send_pending.size()
+                      ? conn->send_pending_cap - conn->send_pending.size()
+                      : 0;
+    size_t accepted = std::min(len, room);
+    conn->send_pending.insert(conn->send_pending.end(), data, data + accepted);
     flush_send(conn, tun_fd, trace);
-    return len;
+    return accepted;
 }
 
 size_t tcp_recv(TCPConnPtr conn, uint8_t* buf, size_t maxlen) {
