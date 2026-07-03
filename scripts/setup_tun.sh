@@ -2,7 +2,7 @@
 # Creates a persistent tun0 device via `ip tuntap add` (so it exists
 # before minitcp runs, matching the README's run order), assigns a
 # point-to-point address pair, and brings it up. minitcp's
-# tun_alloc() (src/tun.cpp) then opens /dev/net/tun and
+# tun_alloc() (src/tun.rs) then opens /dev/net/tun and
 # ioctl(TUNSETIFF)s onto this existing device by name rather than
 # creating a new one.
 #

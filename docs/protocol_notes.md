@@ -5,7 +5,7 @@ worked checksum example. All headers below are written assuming no
 options (IP IHL is always 5, TCP data offset is always 5) — see
 [Known Limitations](#known-limitations).
 
-## IPv4 header (20 bytes) — `include/ip.h`, `src/ip.cpp`
+## IPv4 header (20 bytes) — `src/ip.rs`
 
 RFC 791. All multi-byte fields are network (big-endian) byte order on
 the wire; `parse_ip_header`/`build_ip_header` convert to/from host
@@ -43,7 +43,7 @@ about it.
 | 12-15 | source address | 4 | |
 | 16-19 | destination address | 4 | |
 
-## ICMP header (8 bytes) — `include/icmp.h`, `src/icmp.cpp`
+## ICMP header (8 bytes) — `src/icmp.rs`
 
 RFC 792. Only Echo Request (type 8) / Echo Reply (type 0) are
 implemented.
@@ -59,7 +59,7 @@ implemented.
 Checksum covers the ICMP header + data only — **no pseudo-header**,
 unlike UDP/TCP.
 
-## UDP header (8 bytes) — `include/udp.h`, `src/udp.cpp`
+## UDP header (8 bytes) — `src/udp.rs`
 
 RFC 768.
 
@@ -75,7 +75,7 @@ zero byte, protocol=17, UDP length) in addition to the header + data —
 this is the detail most often gotten wrong, since it pulls fields from
 the *IP* header into a TCP/UDP-layer checksum.
 
-## TCP header (20 bytes) — `include/tcp.h`, `src/tcp.cpp`
+## TCP header (20 bytes) — `src/tcp.rs`
 
 RFC 793 / RFC 9293.
 
@@ -107,7 +107,7 @@ RFC 793 / RFC 9293.
 | 16-17 | checksum | 2 | pseudo-header + header + data, like UDP but protocol=6 |
 | 18-19 | urgent pointer | 2 | unused (URG not implemented) |
 
-## Checksum algorithm (RFC 1071) — `checksum16()` in `src/ip.cpp`
+## Checksum algorithm (RFC 1071) — `checksum16()` in `src/ip.rs`
 
 1. Treat the buffer as a sequence of 16-bit big-endian words (the
    trailing byte of an odd-length buffer is the high byte of a
@@ -119,7 +119,7 @@ RFC 793 / RFC 9293.
 4. The checksum is the one's complement of the result: `~sum & 0xFFFF`.
 
 **Worked example** (the classic RFC 1071 vector, also in
-`tests/checksum_test.cpp`): bytes `00 01 f2 03 f4 f5 f6 f7`.
+`src/ip.rs`'s `known_vector` unit test): bytes `00 01 f2 03 f4 f5 f6 f7`.
 
 ```
 words:  0x0001 + 0xf203 + 0xf4f5 + 0xf6f7

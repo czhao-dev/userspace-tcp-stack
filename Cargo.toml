@@ -1,0 +1,27 @@
+[package]
+name = "minitcp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "minitcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minitcp"
+path = "src/bin/minitcp.rs"
+
+[[bin]]
+name = "chat_server"
+path = "src/bin/chat_server.rs"
+
+[[bin]]
+name = "chat_client"
+path = "src/bin/chat_client.rs"
+
+[dependencies]
+libc = "0.2"
+rand = "0.8"
+
+[profile.release]
+opt-level = 2
