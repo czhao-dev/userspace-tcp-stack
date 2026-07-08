@@ -39,6 +39,46 @@ close and FIN retransmission while in `TIME_WAIT`.
 
 ---
 
+## Repo Structure
+
+```
+minitcp/
+├── README.md
+├── Cargo.toml
+├── docker/
+│   └── Dockerfile           ← Linux dev/runtime environment (TUN needs real Linux)
+├── docker-compose.yml
+├── src/
+│   ├── lib.rs               ← crate root: module declarations, re-exports
+│   ├── tun.rs               ← open/configure the TUN device (libc ioctl, the one real `unsafe`)
+│   ├── ip.rs                ← header parse/construct, checksum
+│   ├── icmp.rs              ← echo request/reply
+│   ├── udp.rs               ← UdpTable: bind registry + per-binding receive queues
+│   ├── tcp.rs               ← the core: state machine + reliability (TcpTable)
+│   ├── stack.rs             ← Stack: owns all protocol state, the socket API
+│   └── bin/
+│       ├── minitcp.rs       ← bare protocol demo: ICMP echo + UDP auto-echo
+│       ├── chat_server.rs   ← demo app: chat + HTTP, built on the socket API
+│       └── chat_client.rs
+├── tests/
+│   ├── retransmission.rs    ← simulate packet loss, verify retry + backoff
+│   └── sockopt.rs           ← setsockopt/getsockopt, SO_RCVTIMEO actually timing out
+├── scripts/
+│   ├── setup_tun.sh         ← create tun0/tun1 with point-to-point addressing
+│   └── teardown_tun.sh
+└── docs/
+    ├── protocol_notes.md    ← header layouts, byte offsets, checksum algorithm
+    └── state_machine.md     ← annotated FSM, RFC sections, scope cuts
+```
+
+Unit tests for `checksum16`, the TCP state machine, and the UDP socket layer
+live as `#[cfg(test)] mod tests` blocks inside `ip.rs`/`tcp.rs`/`udp.rs`
+respectively — `cargo test` discovers these automatically alongside the two
+integration tests above, with no separate test-registration step (unlike
+CTest's `add_test`).
+
+---
+
 ## What MiniTCP Implements
 
 **IP layer** — `src/ip.rs`
@@ -325,46 +365,6 @@ test so_rcvtimeo_actually_times_out ... ok
 | MiniTCP talking to MiniTCP | `chat_client` ↔ `chat_server` on separate TUN devices, bridged by real kernel IP forwarding | full two-party conversation over our own TCP implementation on both ends |
 | UDP socket API | a small program using `Stack::udp_socket`/`bind`/`recvfrom`/`sendto`, exercised with `nc -u 10.0.0.2 <port>` | bound port: trace shows `deliver -> bound app socket`, the app echoes the datagram; a *different*, unbound port still auto-echoes as before |
 | `SO_RCVTIMEO` | the same program, left idle with a 1s receive timeout set | `Stack::recvfrom` returns `minitcp::TIMEOUT` once a second instead of blocking forever |
-
----
-
-## Repo Structure
-
-```
-minitcp/
-├── README.md
-├── Cargo.toml
-├── docker/
-│   └── Dockerfile           ← Linux dev/runtime environment (TUN needs real Linux)
-├── docker-compose.yml
-├── src/
-│   ├── lib.rs                 ← crate root: module declarations, re-exports
-│   ├── tun.rs                   ← open/configure the TUN device (libc ioctl, the one real `unsafe`)
-│   ├── ip.rs                      ← header parse/construct, checksum
-│   ├── icmp.rs                      ← echo request/reply
-│   ├── udp.rs                         ← UdpTable: bind registry + per-binding receive queues
-│   ├── tcp.rs                            ← the core: state machine + reliability (TcpTable)
-│   ├── stack.rs                             ← Stack: owns all protocol state, the socket API
-│   └── bin/
-│       ├── minitcp.rs                         ← bare protocol demo: ICMP echo + UDP auto-echo
-│       ├── chat_server.rs                       ← demo app: chat + HTTP, built on the socket API
-│       └── chat_client.rs
-├── tests/
-│   ├── retransmission.rs                          ← simulate packet loss, verify retry + backoff
-│   └── sockopt.rs                                   ← setsockopt/getsockopt, SO_RCVTIMEO actually timing out
-├── scripts/
-│   ├── setup_tun.sh                       ← create tun0/tun1 with point-to-point addressing
-│   └── teardown_tun.sh
-└── docs/
-    ├── protocol_notes.md                    ← header layouts, byte offsets, checksum algorithm
-    └── state_machine.md                       ← annotated FSM, RFC sections, scope cuts
-```
-
-Unit tests for `checksum16`, the TCP state machine, and the UDP socket layer
-live as `#[cfg(test)] mod tests` blocks inside `ip.rs`/`tcp.rs`/`udp.rs`
-respectively — `cargo test` discovers these automatically alongside the two
-integration tests above, with no separate test-registration step (unlike
-CTest's `add_test`).
 
 ---
 
