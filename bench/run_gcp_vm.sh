@@ -21,7 +21,11 @@ cleanup() {
 trap cleanup EXIT
 
 sudo apt-get update
-sudo apt-get install -y build-essential iproute2 python3 python3-matplotlib
+sudo apt-get install -y build-essential curl iproute2 python3 python3-matplotlib
+if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
 
 cargo build --release
 mkdir -p "$RESULT_DIR"
