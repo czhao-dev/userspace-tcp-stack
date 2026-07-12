@@ -25,7 +25,7 @@ sudo apt-get install -y build-essential iproute2 python3 python3-matplotlib
 
 cargo build --release
 mkdir -p "$RESULT_DIR"
-git rev-parse HEAD >"$RESULT_DIR/git-revision.txt"
+printf '%s\n' "${GIT_REVISION:-$(git rev-parse HEAD)}" >"$RESULT_DIR/git-revision.txt"
 uname -a >"$RESULT_DIR/uname.txt"
 lscpu >"$RESULT_DIR/lscpu.txt"
 
