@@ -19,6 +19,10 @@ path = "src/bin/chat_server.rs"
 name = "chat_client"
 path = "src/bin/chat_client.rs"
 
+[[bin]]
+name = "bench_echo_server"
+path = "src/bin/bench_echo_server.rs"
+
 [dependencies]
 libc = "0.2"
 rand = "0.8"
