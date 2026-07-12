@@ -203,7 +203,7 @@ the RFC section and implementing function for every transition.
 ## Architecture
 
 ```
-Application (chat client/server, or a manual test harness)
+ Application (chat client/server, or a manual test harness)
         │
         ▼
  Socket-like API     TCP: connect/listen/accept/send/recv
@@ -213,14 +213,14 @@ Application (chat client/server, or a manual test harness)
  TCP                 state machine, sliding window, retransmission
         │
         ▼
- UDP / ICMP           UDP: deliver to a bound socket, else auto-echo
-                      ICMP: echo reply
+ UDP / ICMP          UDP: deliver to a bound socket, else auto-echo
+                     ICMP: echo reply
         │
         ▼
  IP                  header parse/construct, checksum, routing decision
         │
         ▼
- TUN device           /dev/net/tun — kernel hands us raw IP packets
+ TUN device          /dev/net/tun — kernel hands us raw IP packets
         │
         ▼
  Linux kernel routing / real network
