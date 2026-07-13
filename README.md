@@ -181,7 +181,7 @@ the RFC section and implementing function for every transition.
                           ▼                                     ▼
                   ┌─────────────┐                       ┌─────────────┐
                   │ FIN_WAIT_2  │                       │   CLOSING   │
-                  └──────┬──────┘                       └──────┬──────┘
+                  └──────┬──────┘                       └───────┬─────┘
                          │ recv FIN (send ACK)                  │ recv ACK
                          ▼                                      │
                   ┌─────────────┐                               │

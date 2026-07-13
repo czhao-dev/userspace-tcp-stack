@@ -37,7 +37,7 @@ dispatches into per-connection.
                           ▼                                     ▼
                   ┌─────────────┐                       ┌─────────────┐
                   │ FIN_WAIT_2  │                       │   CLOSING   │
-                  └──────┬──────┘                       └──────┬──────┘
+                  └──────┬──────┘                       └───────┬─────┘
                          │ recv FIN (send ACK)                  │ recv ACK
                          ▼                                      │
                   ┌─────────────┐                               │
