@@ -5,37 +5,39 @@
 [![Docker](https://img.shields.io/badge/dev%20env-Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20TUN-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![Tests](https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen)](#test-results)
+[![Benchmark](https://img.shields.io/badge/GCP%20TUN%20echo-22.38%20MiB%2Fs-4c1)](#benchmark-gcp-tun-echo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-> A TCP/IP protocol stack implemented entirely in user space over a Linux TUN
-> virtual network interface — IP, ICMP, UDP, and a full eleven-state TCP
-> state machine with sliding-window flow control, retransmission, and
-> out-of-order reassembly — interoperable with real tools like `ping`,
-> `curl`, and `netcat` against the actual Linux network stack, and with a
-> second instance of itself across two TUN devices bridged by the kernel.
+> A TCP/IP stack written in Rust that processes raw IP packets over a Linux TUN
+> interface. It implements IPv4, ICMP, UDP, and an eleven-state TCP machine
+> with retransmission, flow control, and out-of-order reassembly—and is
+> exercised by unmodified `ping`, `curl`, and `netcat` clients.
+
+## Portfolio snapshot
+
+| Area | Evidence |
+|---|---|
+| **Protocol work** | IPv4 parsing/checksums, ICMP echo, UDP, and TCP from raw packet bytes upward |
+| **TCP reliability** | Handshake, all eleven RFC states, receive-window flow control, retransmission/backoff, reassembly, and teardown |
+| **Application boundary** | Socket-like TCP/UDP API with observable receive-timeout and buffer options |
+| **Validation** | 11 automated tests, lossy in-process link simulation, and real Linux interoperability checks |
+| **Measured performance** | 22.38 MiB/s median application-payload throughput on a GCP `e2-standard-2` TUN echo benchmark |
 
 ---
 
-## Overview
+## Why this project
 
-MiniTCP implements the core of the TCP/IP protocol suite from raw packet
-bytes upward, bypassing the kernel's own network stack by reading and writing
-IP packets directly through a TUN device. The kernel hands MiniTCP raw IP
-packets; everything above that — header parsing, checksums, the ICMP echo
-protocol, UDP, and the full TCP connection lifecycle — is implemented by hand.
+MiniTCP moves the boundary normally hidden inside the kernel into a compact,
+inspectable Rust codebase. Linux provides a TUN interface that exchanges raw IP
+packets; MiniTCP owns everything above it: header parsing and checksums, packet
+dispatch, connection lifecycle, retransmission, buffering, and the
+application-facing socket API.
 
-The project is intentionally small enough to inspect end to end while still
-behaving like a real network endpoint. A `connect()` from `curl` or `netcat`
-turns into raw TCP segments on the TUN device; MiniTCP parses those packets,
-updates protocol state, generates replies, retransmits lost data, and delivers
-application bytes in order.
-
-The TCP implementation is centered on an explicit finite state machine:
-`LISTEN`, `SYN_RCVD`, `ESTABLISHED`, `FIN_WAIT`, `TIME_WAIT`, `CLOSED`, and
-the other RFC-defined states are represented directly in code. Each transition
-is driven by incoming segment flags, local API calls, retransmission timers, or
-connection teardown events, including less common cases such as simultaneous
-close and FIN retransmission while in `TIME_WAIT`.
+That makes each familiar network operation concrete. A `curl` connection
+becomes a SYN on the TUN device, then explicit state transitions and generated
+segments. The implementation remains small enough to follow end to end while
+still interoperating with the host's real networking tools and a second
+MiniTCP instance across kernel IP forwarding.
 
 ---
 
@@ -59,10 +61,12 @@ minitcp/
 │   └── bin/
 │       ├── minitcp.rs       ← bare protocol demo: ICMP echo + UDP auto-echo
 │       ├── chat_server.rs   ← demo app: chat + HTTP, built on the socket API
-│       └── chat_client.rs
+│       ├── chat_client.rs
+│       └── bench_echo_server.rs ← quiet TCP echo peer for repeatable measurements
 ├── tests/
 │   ├── retransmission.rs    ← simulate packet loss, verify retry + backoff
 │   └── sockopt.rs           ← setsockopt/getsockopt, SO_RCVTIMEO actually timing out
+├── bench/                    ← GCP runner, raw results, and matplotlib plot
 ├── scripts/
 │   ├── setup_tun.sh         ← create tun0/tun1 with point-to-point addressing
 │   └── teardown_tun.sh
@@ -127,19 +131,11 @@ application code looks like BSD sockets and never touches `TcpConnection`/
 
 - TCP: `Stack::socket`, `listen`, `accept`, `connect`, `send`, `recv`,
   `close`. Used by both demo apps below.
-- UDP: `Stack::udp_socket`, `bind`, `sendto`, `recvfrom`, addressed with
-  `std::net::SocketAddrV4` rather than a raw `sockaddr_in` — nothing here
-  calls a real OS socket syscall with one, so the idiomatic Rust type is a
-  strict improvement over reimplementing POSIX's C struct for no benefit.
-- Socket options: `Stack::setsockopt` takes a small `SockOpt` enum
-  (`RcvTimeo`/`ReuseAddr`/`RcvBuf`/`SndBuf`) instead of mirroring POSIX's
-  `(level, optname, void*, optlen)` signature — same reasoning as the UDP
-  address type. All four are wired up to real, observable behavior rather
-  than just stored — `SockOpt::RcvTimeo` makes `recv`/`recvfrom`/`accept`
-  actually stop blocking, `SockOpt::ReuseAddr` lets `listen()` bypass a port
-  still occupied by a connection in `TIME_WAIT`, and `SockOpt::RcvBuf`/
-  `SndBuf` tune the per-socket buffer caps. All four are opt-in and don't
-  change the behavior of any call site that doesn't use them.
+- UDP: `Stack::udp_socket`, `bind`, `sendto`, `recvfrom`, using idiomatic
+  `std::net::SocketAddrV4` values.
+- Socket options: a typed `SockOpt` enum for receive timeouts, address reuse,
+  and receive/send buffer caps. Each option changes behavior, rather than
+  merely being stored as metadata.
 
 **Demo apps** — `src/bin/chat_server.rs`, `src/bin/chat_client.rs`
 A minimal chat server/client built only on the socket API. The server also
@@ -203,30 +199,33 @@ the RFC section and implementing function for every transition.
 ## Architecture
 
 ```
- Application (chat client/server, or a manual test harness)
-        │
-        ▼
- Socket-like API     TCP: connect/listen/accept/send/recv
-                     UDP: bind/sendto/recvfrom (sockaddr_in, setsockopt)
-        │
-        ▼
- TCP                 state machine, sliding window, retransmission
-        │
-        ▼
- UDP / ICMP          UDP: deliver to a bound socket, else auto-echo
-                     ICMP: echo reply
-        │
-        ▼
- IP                  header parse/construct, checksum, routing decision
-        │
-        ▼
- TUN device          /dev/net/tun — kernel hands us raw IP packets
-        │
-        ▼
- Linux kernel routing / real network
-        │
-        ▼
- External tools: ping, curl, netcat — talk to MiniTCP as a real IP endpoint
+                         Application
+          chat client/server or a manual test harness
+                              │
+                              ▼
+                        Socket-like API
+       TCP: connect/listen/accept/send/recv
+       UDP: bind/sendto/recvfrom + typed socket options
+                              │
+                              ▼
+                             TCP
+       state machine, sliding window, reassembly, retransmission
+                              │
+                              ▼
+                          UDP / ICMP
+       UDP binding/auto-echo                         ICMP echo reply
+                              │
+                              ▼
+                              IP
+       IPv4 header parse/build, checksum, route decision
+                              │
+                              ▼
+                         TUN device
+       `/dev/net/tun` exchanges raw IP packets with the kernel
+                              │
+                              ▼
+                 Linux routing and real network tools
+                 `ping`, `curl`, and `netcat`
 ```
 
 The TUN device is the key piece of infrastructure that makes this project
@@ -238,6 +237,36 @@ producing a stack that real, unmodified tools can talk to.
 Development happens on macOS via Docker (a Linux container, since TUN/TAP
 needs a real Linux kernel); the same `Dockerfile`/`docker-compose.yml` work
 unmodified on a native Linux host.
+
+---
+
+## Benchmark: GCP TUN echo
+
+![GCP MiniTCP TUN echo throughput and elapsed-time plot](bench/results/gcp-e2-standard-2-20260712/echo-throughput.png)
+
+MiniTCP reached a **22.38 MiB/s median** application-payload throughput on a
+Google Compute Engine `e2-standard-2` VM (two vCPUs), with five measured 4 MiB
+echo transfers after one warm-up. Samples ranged from **21.83 to 22.60 MiB/s**;
+the fourth trial is the slowest, but the plot shows a tight overall band and no
+runaway variance.
+
+This measures a kernel TCP client sending data through `tun0` to the quiet
+`bench_echo_server`, which echoes it through MiniTCP. It is intentionally a
+single-client, same-VM end-to-end TUN measurement: it validates the stack's
+data path without claiming Internet throughput or multi-connection
+scalability. The [raw samples](bench/results/gcp-e2-standard-2-20260712/echo.json),
+[host metadata](bench/results/gcp-e2-standard-2-20260712/lscpu.txt), and
+[benchmark notes](bench/results/gcp-e2-standard-2-20260712/README.md) are
+versioned with the plot.
+
+To reproduce on a Linux VM with `/dev/net/tun` and passwordless `sudo`:
+
+```bash
+./bench/run_gcp_vm.sh
+```
+
+The runner installs its dependencies, builds the release binary, captures JSON
+and host metadata, renders the matplotlib plot, and removes `tun0` on exit.
 
 ---
 
