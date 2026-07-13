@@ -242,7 +242,7 @@ unmodified on a native Linux host.
 
 ## Benchmark: GCP TUN echo
 
-![GCP MiniTCP TUN echo throughput and elapsed-time plot](bench/results/gcp-e2-standard-2-20260712/echo-throughput.png)
+![GCP MiniTCP TUN echo throughput and elapsed-time plot](docs/assets/gcp-tun-echo-throughput.png)
 
 MiniTCP reached a **22.38 MiB/s median** application-payload throughput on a
 Google Compute Engine `e2-standard-2` VM (two vCPUs), with five measured 4 MiB
@@ -254,10 +254,8 @@ This measures a kernel TCP client sending data through `tun0` to the quiet
 `bench_echo_server`, which echoes it through MiniTCP. It is intentionally a
 single-client, same-VM end-to-end TUN measurement: it validates the stack's
 data path without claiming Internet throughput or multi-connection
-scalability. The [raw samples](bench/results/gcp-e2-standard-2-20260712/echo.json),
-[host metadata](bench/results/gcp-e2-standard-2-20260712/lscpu.txt), and
-[benchmark notes](bench/results/gcp-e2-standard-2-20260712/README.md) are
-versioned with the plot.
+scalability. The figure is retained as portfolio documentation; raw benchmark
+output is machine-specific and intentionally ignored by Git.
 
 To reproduce on a Linux VM with `/dev/net/tun` and passwordless `sudo`:
 

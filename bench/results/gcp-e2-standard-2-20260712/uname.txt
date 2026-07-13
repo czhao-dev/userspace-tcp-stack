@@ -1,1 +1,0 @@
-Linux minitcp-bench-20260712 6.8.0-1063-gcp #69~22.04.1-Ubuntu SMP Tue Jun 30 15:12:15 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux

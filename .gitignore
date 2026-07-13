@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 target/
+
+# Machine-specific output from the 2026-07-12 GCP benchmark run.
+bench/results/gcp-e2-standard-2-20260712/
