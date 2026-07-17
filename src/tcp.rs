@@ -1181,4 +1181,276 @@ mod tests {
         table.handle_segment(fd, &ip_hdr, &final_ack, false);
         assert!(table.is_closed(accepted));
     }
+
+    /// Drives a fresh listener through SYN -> SYN_RCVD -> (ACK) ->
+    /// ESTABLISHED, returning the accepted connection's key, the server's
+    /// ISS, and the client's next usable sequence number (one past the SYN).
+    fn handshake_to_established(
+        table: &mut TcpTable,
+        fd: RawFd,
+        ip_hdr: &IpHeader,
+        client_iss: u32,
+    ) -> (ConnectionKey, u32, u32) {
+        assert!(table.listen(SERVER_ADDR, SERVER_PORT, false));
+
+        let syn = build_segment(CLIENT_PORT, SERVER_PORT, client_iss, 0, TCP_SYN, b"", CLIENT_ADDR, SERVER_ADDR);
+        table.handle_segment(fd, ip_hdr, &syn, false);
+
+        let key = ConnectionKey {
+            local_addr: SERVER_ADDR,
+            local_port: SERVER_PORT,
+            remote_addr: CLIENT_ADDR,
+            remote_port: CLIENT_PORT,
+        };
+        assert_eq!(table.lookup(key).unwrap().state, TcpState::SynRcvd);
+        let server_iss = table.lookup(key).unwrap().iss;
+
+        let client_seq = client_iss.wrapping_add(1);
+        let ack = build_segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq,
+            server_iss.wrapping_add(1),
+            TCP_ACK,
+            b"",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, ip_hdr, &ack, false);
+        assert_eq!(table.lookup(key).unwrap().state, TcpState::Established);
+
+        let accepted = table.accept(SERVER_ADDR, SERVER_PORT).unwrap();
+        assert_eq!(accepted, key);
+
+        (key, server_iss, client_seq)
+    }
+
+    /// Like `test_support::build_segment`, but with a caller-chosen
+    /// advertised window instead of the fixed 65535 — needed to exercise
+    /// flow-control-limited sends without touching `test_support` (which
+    /// other tests/files also rely on staying at a full-size window).
+    fn build_segment_with_window(
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        window: u16,
+        data: &[u8],
+        src_addr: u32,
+        dst_addr: u32,
+    ) -> Vec<u8> {
+        let hdr = TcpHeader {
+            src_port,
+            dst_port,
+            seq_num: seq,
+            ack_num: ack,
+            data_offset_reserved: 5 << 4,
+            flags,
+            window,
+            checksum: 0,
+            urgent_ptr: 0,
+        };
+        let mut seg = vec![0u8; TCP_HEADER_LEN + data.len()];
+        build_tcp_header(&hdr, &mut seg);
+        if !data.is_empty() {
+            seg[TCP_HEADER_LEN..].copy_from_slice(data);
+        }
+        let csum = tcp_checksum(src_addr, dst_addr, &seg);
+        seg[16..18].copy_from_slice(&csum.to_be_bytes());
+        seg
+    }
+
+    #[test]
+    fn rst_in_established_aborts_connection() {
+        let fd = dev_null_fd();
+        let mut table = TcpTable::new();
+        let ip_hdr = IpHeader {
+            version: 4,
+            ihl: 5,
+            src_addr: CLIENT_ADDR,
+            dst_addr: SERVER_ADDR,
+            protocol: 6,
+            ttl: 64,
+            ..Default::default()
+        };
+
+        let (key, server_iss, client_seq) = handshake_to_established(&mut table, fd, &ip_hdr, 2000);
+
+        let rst = build_segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq,
+            server_iss.wrapping_add(1),
+            TCP_RST,
+            b"",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &rst, false);
+        assert!(table.is_closed(key));
+    }
+
+    #[test]
+    fn rst_in_close_wait_aborts_connection() {
+        let fd = dev_null_fd();
+        let mut table = TcpTable::new();
+        let ip_hdr = IpHeader {
+            version: 4,
+            ihl: 5,
+            src_addr: CLIENT_ADDR,
+            dst_addr: SERVER_ADDR,
+            protocol: 6,
+            ttl: 64,
+            ..Default::default()
+        };
+
+        let (key, server_iss, client_seq) = handshake_to_established(&mut table, fd, &ip_hdr, 3000);
+
+        let fin = build_segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq,
+            server_iss.wrapping_add(1),
+            TCP_FIN | TCP_ACK,
+            b"",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &fin, false);
+        assert_eq!(table.lookup(key).unwrap().state, TcpState::CloseWait);
+
+        let rst = build_segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq + 1,
+            server_iss.wrapping_add(1),
+            TCP_RST,
+            b"",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &rst, false);
+        assert!(table.is_closed(key));
+    }
+
+    #[test]
+    fn ooo_buffer_respects_recv_cap() {
+        let fd = dev_null_fd();
+        let mut table = TcpTable::new();
+        let ip_hdr = IpHeader {
+            version: 4,
+            ihl: 5,
+            src_addr: CLIENT_ADDR,
+            dst_addr: SERVER_ADDR,
+            protocol: 6,
+            ttl: 64,
+            ..Default::default()
+        };
+
+        let (key, server_iss, client_seq) = handshake_to_established(&mut table, fd, &ip_hdr, 4000);
+        table.set_recv_cap(key, 4); // smaller than the 5-byte out-of-order segment below
+
+        // Leaves a gap (client_seq..client_seq+10 never arrives): genuinely
+        // out of order, and bigger than the 4-byte cap.
+        let too_big = build_segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq + 10,
+            server_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            b"12345",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &too_big, false);
+        assert!(table.lookup(key).unwrap().ooo_buffer.is_empty()); // dropped: exceeds the cap
+
+        let fits = build_segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq + 20,
+            server_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            b"ok",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &fits, false);
+        assert_eq!(table.lookup(key).unwrap().ooo_buffer.len(), 1); // within the cap: buffered
+    }
+
+    #[test]
+    fn close_defers_fin_until_send_pending_drains() {
+        let fd = dev_null_fd();
+        let mut table = TcpTable::new();
+        let ip_hdr = IpHeader {
+            version: 4,
+            ihl: 5,
+            src_addr: CLIENT_ADDR,
+            dst_addr: SERVER_ADDR,
+            protocol: 6,
+            ttl: 64,
+            ..Default::default()
+        };
+
+        assert!(table.listen(SERVER_ADDR, SERVER_PORT, false));
+        let client_iss = 5000u32;
+        let syn = build_segment(CLIENT_PORT, SERVER_PORT, client_iss, 0, TCP_SYN, b"", CLIENT_ADDR, SERVER_ADDR);
+        table.handle_segment(fd, &ip_hdr, &syn, false);
+
+        let key = ConnectionKey {
+            local_addr: SERVER_ADDR,
+            local_port: SERVER_PORT,
+            remote_addr: CLIENT_ADDR,
+            remote_port: CLIENT_PORT,
+        };
+        let server_iss = table.lookup(key).unwrap().iss;
+        let client_seq = client_iss.wrapping_add(1);
+
+        // Complete the handshake advertising a 5-byte window.
+        let ack = build_segment_with_window(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq,
+            server_iss.wrapping_add(1),
+            TCP_ACK,
+            5,
+            b"",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &ack, false);
+        assert_eq!(table.lookup(key).unwrap().state, TcpState::Established);
+        let accepted = table.accept(SERVER_ADDR, SERVER_PORT).unwrap();
+
+        // Queue 10 bytes; only 5 fit in the advertised window, so 5 stay in
+        // send_pending after this call.
+        let sent = table.send(accepted, fd, b"HELLOWORLD", false);
+        assert_eq!(sent, 10);
+
+        // close() while data is still queued behind the window: FIN must be
+        // deferred, not sent immediately (old behavior would abandon the
+        // unsent "WORLD" and jump straight to FIN_WAIT_1 here).
+        table.close(accepted, fd, false);
+        assert_eq!(table.lookup(accepted).unwrap().state, TcpState::Established);
+
+        // Peer ACKs the in-flight chunk, still advertising the same 5-byte
+        // window: this drains the rest of send_pending, and the deferred
+        // FIN finally goes out.
+        let snd_nxt = table.lookup(accepted).unwrap().snd_nxt;
+        let window_update = build_segment_with_window(
+            CLIENT_PORT,
+            SERVER_PORT,
+            client_seq,
+            snd_nxt,
+            TCP_ACK,
+            5,
+            b"",
+            CLIENT_ADDR,
+            SERVER_ADDR,
+        );
+        table.handle_segment(fd, &ip_hdr, &window_update, false);
+        assert_eq!(table.lookup(accepted).unwrap().state, TcpState::FinWait1);
+    }
 }
