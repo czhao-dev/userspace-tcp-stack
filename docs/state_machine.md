@@ -60,17 +60,18 @@ dispatches into per-connection.
 | `SYN_SENT → ESTABLISHED` | RFC 9293 §3.10.7.3 | `process_segment()`, `TcpState::SynSent` arm, on `SYN,ACK` whose `ack_num == snd_nxt` |
 | `SYN_RCVD → ESTABLISHED` | RFC 9293 §3.10.7.4 | `process_segment()`, `TcpState::SynRcvd` arm, on `ACK` whose `ack_num == snd_nxt`; also enqueues the connection into `accept_queues` here |
 | `ESTABLISHED →` data transfer | RFC 9293 §3.10.7.4 | `TcpState::Established` arm → `receive_data_and_maybe_fin()` (in-order delivery, out-of-order buffering, FIN detection) + `flush_send()` (window-limited send) |
-| `ESTABLISHED → FIN_WAIT_1` | RFC 9293 §3.10.4 (local close) | `TcpTable::close()`, `TcpState::Established` arm |
+| `ESTABLISHED → FIN_WAIT_1` | RFC 9293 §3.10.4 (local close) | `TcpTable::close()` marks `pending_close`; `flush_send()` sends the FIN and makes the transition once `send_pending` has actually drained (immediately, if nothing was queued) |
 | `ESTABLISHED → CLOSE_WAIT` | RFC 9293 §3.10.7.4 (remote FIN) | `TcpState::Established` arm, when `receive_data_and_maybe_fin()` reports the FIN was consumed |
 | `FIN_WAIT_1 → FIN_WAIT_2` | RFC 9293 §3.10.7.5 | `TcpState::FinWait1` arm, `our_fin_acked && !fin` |
 | `FIN_WAIT_1 → CLOSING` | RFC 9293 §3.10.7.5 (simultaneous close) | `TcpState::FinWait1` arm, `!our_fin_acked && fin` |
 | `FIN_WAIT_1 → TIME_WAIT` | RFC 9293 §3.10.7.5 (both at once) | `TcpState::FinWait1` arm, `our_fin_acked && fin` |
 | `FIN_WAIT_2 → TIME_WAIT` | RFC 9293 §3.10.7.5 | `TcpState::FinWait2` arm, on remote FIN |
 | `CLOSING → TIME_WAIT` | RFC 9293 §3.10.7.5 | `TcpState::Closing` arm, on ACK of our FIN |
-| `CLOSE_WAIT → LAST_ACK` | RFC 9293 §3.10.4 | `TcpTable::close()`, `TcpState::CloseWait` arm |
+| `CLOSE_WAIT → LAST_ACK` | RFC 9293 §3.10.4 | `TcpTable::close()` marks `pending_close`; `flush_send()` makes the transition once `send_pending` has drained, same as the `ESTABLISHED` case above |
 | `LAST_ACK → CLOSED` | RFC 9293 §3.10.7.5 | `TcpState::LastAck` arm, on ACK of our FIN |
 | `TIME_WAIT → CLOSED` | RFC 9293 §3.10.8 (2 MSL) | `TcpTable::tick()`, deadline check |
 | `TIME_WAIT` re-ACKs a duplicate FIN | RFC 9293 §3.10.8 | `TcpState::TimeWait` arm — re-sends the ACK and restarts the timer; this is the one case that *must* still respond, since it exists specifically to handle a lost final ACK |
+| any live state → `CLOSED` on incoming `RST` | RFC 9293 §3.10.7 (general case) | `process_segment()` — a single check hoisted above the per-state `match`, so every state (not just `SYN_SENT`/`SYN_RCVD`) aborts the connection on RST |
 
 ## Simultaneous open and close
 
@@ -96,6 +97,12 @@ dispatches into per-connection.
   this (`send_rst_for_unknown()` in `src/tcp.rs`) so a segment
   arriving for a port nobody is listening on gets a `RST,ACK` rather
   than silent drop — visible in the trace as `port N unreachable`.
+  That's RST *generation* for a connection that doesn't exist; RST
+  *handling* for one that does (a peer resetting a live connection) is
+  the separate, uniform check described in the transition table above
+  — no sequence/ACK-number validation is applied to it, matching the
+  same unconditional acceptance the handshake-only checks it replaced
+  already had.
 
 ## Why no real congestion control
 

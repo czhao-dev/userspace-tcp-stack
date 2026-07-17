@@ -153,3 +153,14 @@ back — `verify_ip_checksum()` / `tcp_checksum() == 0` do the reverse.
 - No real congestion control (no slow start / cwnd) — see
   [state_machine.md](state_machine.md) and the main README for why
   this was scoped out.
+- A zero receive window (peer's `SO_RCVBUF` full) does **not** stall
+  the connection forever: `flush_send()` arms a persist timer (RFC
+  9293 §3.8.6.1) with the same exponential-backoff shape as the data
+  retransmit timer, re-sending a 1-byte probe until the window
+  reopens — this covers the case where the window-reopening ACK
+  itself gets lost, which a naive "wait for the next incoming
+  segment" approach can't recover from.
+- The out-of-order reassembly buffer counts against
+  `recv_buffer_cap`/`SO_RCVBUF` the same way in-order data does, so
+  a connection under reordering can't buffer unbounded memory just
+  because none of it has spliced into order yet.
