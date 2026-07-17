@@ -4,7 +4,7 @@
 [![Cargo](https://img.shields.io/badge/build-Cargo-064F8C?logo=rust&logoColor=white)](https://doc.rust-lang.org/cargo/)
 [![Docker](https://img.shields.io/badge/dev%20env-Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20TUN-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
-[![Tests](https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-16%2F16%20passing-brightgreen)](#test-results)
 [![Benchmark](https://img.shields.io/badge/GCP%20TUN%20echo-22.38%20MiB%2Fs-4c1)](#benchmark-gcp-tun-echo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
@@ -321,12 +321,12 @@ hello
 
 ## Test Results
 
-Eight unit tests (in-crate `#[cfg(test)]` modules) plus three integration
-tests (in `tests/`, run as separate crates against the public API), all run
-via `cargo test`:
+Twelve unit tests (in-crate `#[cfg(test)]` modules) plus four integration
+tests (in `tests/`, three files, run as separate crates against the public
+API), all run via `cargo test`:
 
 ```
-running 8 tests
+running 12 tests
 test ip::tests::known_vector ... ok
 test ip::tests::odd_length ... ok
 test ip::tests::build_then_verify_round_trip ... ok
@@ -335,8 +335,12 @@ test udp::tests::sendto_recvfrom_round_trip ... ok
 test udp::tests::recv_queue_cap_drops_oversized_datagram ... ok
 test udp::tests::so_reuseaddr_listen_guard ... ok
 test tcp::tests::full_lifecycle_handshake_ooo_and_close ... ok
+test tcp::tests::rst_in_established_aborts_connection ... ok
+test tcp::tests::rst_in_close_wait_aborts_connection ... ok
+test tcp::tests::ooo_buffer_respects_recv_cap ... ok
+test tcp::tests::close_defers_fin_until_send_pending_drains ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
      Running tests/retransmission.rs
 test retransmission_under_packet_loss ... ok
@@ -344,6 +348,9 @@ test retransmission_under_packet_loss ... ok
      Running tests/sockopt.rs
 test getsockopt_round_trip ... ok
 test so_rcvtimeo_actually_times_out ... ok
+
+     Running tests/zero_window_persist.rs
+test zero_window_triggers_persist_probe ... ok
 ```
 
 - **`ip::tests`** — the RFC 1071 worked example, a build/verify
@@ -353,6 +360,23 @@ test so_rcvtimeo_actually_times_out ... ok
   device): three data segments delivered **out of order** (`C, A, B`) are
   reassembled correctly before being handed to the application, then the
   connection is torn down via remote-FIN → local `close()`.
+- **`tcp::tests::rst_in_established_aborts_connection` /
+  `rst_in_close_wait_aborts_connection`** — a bare `RST` delivered
+  post-handshake (from `ESTABLISHED` and from `CLOSE_WAIT`) aborts the
+  connection to `CLOSED`, per RFC 9293 §3.10.7 — not just during the
+  handshake, which is all `SYN_SENT`/`SYN_RCVD` originally checked.
+- **`tcp::tests::ooo_buffer_respects_recv_cap`** — an out-of-order segment
+  that would push buffered bytes past a small `recv_buffer_cap` is dropped
+  rather than buffered, mirroring `udp::tests::recv_queue_cap_drops_oversized_datagram`.
+- **`tcp::tests::close_defers_fin_until_send_pending_drains`** — calling
+  `close()` while data is still queued behind a small advertised window
+  doesn't abandon it: the FIN is deferred until `send_pending` actually
+  drains.
+- **`tests/zero_window_persist.rs`** — a fake peer advertises a zero
+  receive window from the handshake onward; once data is queued behind it,
+  a 1-byte persist probe (RFC 9293 §3.8.6.1) goes out on the wire after
+  `INITIAL_RTO` elapses, so a lost window-reopening ACK can't stall the
+  connection forever.
 - **`tests/retransmission.rs`** — two in-process TCP endpoints connected
   over a lossy simulated link (a real packet-loss harness, not a mock), run
   at 0%, 10%, and 30% simulated loss in a single test:
