@@ -203,6 +203,9 @@ impl TcpConnection {
             recv_buffer: Vec::new(),
             send_pending: Vec::new(),
             time_wait_deadline: Instant::now(),
+            probe_deadline: None,
+            probe_rto: INITIAL_RTO,
+            pending_close: false,
             recv_buffer_cap: DEFAULT_RECV_BUFFER_CAP,
             send_pending_cap: DEFAULT_SEND_BUFFER_CAP,
         }
@@ -365,11 +368,21 @@ fn process_ack(conn: &mut TcpConnection, seg: &TcpHeader) {
         remove_acked(conn, conn.snd_una);
     }
     conn.snd_wnd = seg.window as u32;
+    if conn.snd_wnd != 0 {
+        conn.probe_deadline = None;
+        conn.probe_rto = INITIAL_RTO;
+    }
 }
 
 fn flush_send(conn: &mut TcpConnection, tun_fd: RawFd, trace: bool) {
     if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
         return;
+    }
+    if conn.snd_wnd == 0 && !conn.send_pending.is_empty() {
+        // Peer's window is closed and we still have data queued: arm the
+        // persist timer (RFC 9293 §3.8.6.1) so we don't stall forever if
+        // the window-reopening ACK gets lost. tick() sends the probes.
+        conn.probe_deadline.get_or_insert(Instant::now() + INITIAL_RTO);
     }
     while !conn.send_pending.is_empty() {
         let bytes_in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una);
@@ -384,6 +397,24 @@ fn flush_send(conn: &mut TcpConnection, tun_fd: RawFd, trace: bool) {
         let chunk: Vec<u8> = conn.send_pending[..chunk_len].to_vec();
         queue_and_send(conn, tun_fd, TCP_ACK | TCP_PSH, &chunk, trace);
         conn.send_pending.drain(..chunk_len);
+    }
+
+    // close() may have deferred the FIN because send_pending wasn't empty
+    // yet. Now that we've drained as much as the window allows, send it if
+    // the backlog is actually gone.
+    if conn.pending_close && conn.send_pending.is_empty() {
+        match conn.state {
+            TcpState::Established => {
+                queue_and_send(conn, tun_fd, TCP_FIN | TCP_ACK, &[], trace);
+                conn.state = TcpState::FinWait1;
+            }
+            TcpState::CloseWait => {
+                queue_and_send(conn, tun_fd, TCP_FIN | TCP_ACK, &[], trace);
+                conn.state = TcpState::LastAck;
+            }
+            _ => {}
+        }
+        conn.pending_close = false;
     }
 }
 
@@ -740,6 +771,33 @@ impl TcpTable {
                 continue;
             }
 
+            let old_state = conn.state;
+
+            if matches!(conn.state, TcpState::Established | TcpState::CloseWait) {
+                if let Some(deadline) = conn.probe_deadline {
+                    if now >= deadline {
+                        // Zero-window persist probe (RFC 9293 §3.8.6.1): resend
+                        // one already-used byte to force a fresh ACK/window
+                        // update out of the peer. Not queue_and_send() — this
+                        // must not consume new sequence space or enter the
+                        // data-retransmit queue, and has no MAX_RETRIES-style
+                        // give-up; it backs off until the window reopens.
+                        let probe_seq = conn.snd_una.wrapping_sub(1);
+                        if trace {
+                            println!(
+                                "[TCP ] persist probe seq={probe_seq} (rto={}ms)",
+                                conn.probe_rto.as_millis()
+                            );
+                        }
+                        send_segment(conn, tun_fd, TCP_ACK, probe_seq, &[0u8], trace);
+                        conn.probe_rto = (conn.probe_rto * 2).min(MAX_RTO);
+                        conn.probe_deadline = Some(now + conn.probe_rto);
+                    }
+                }
+            } else {
+                conn.probe_deadline = None; // left Established/CloseWait; stop persisting
+            }
+
             if let Some(front) = conn.retransmit_queue.front() {
                 if now.duration_since(front.sent_at) >= front.rto {
                     if front.retry_count >= MAX_RETRIES {
@@ -774,6 +832,10 @@ impl TcpTable {
             }
 
             flush_send(conn, tun_fd, trace);
+
+            if trace && conn.state != old_state {
+                println!("[TCP ] state {} -> {}", old_state.name(), conn.state.name());
+            }
         }
 
         self.cleanup_closed_connections();
@@ -890,20 +952,19 @@ impl TcpTable {
         n
     }
 
-    /// Initiates graceful close (sends FIN if applicable).
+    /// Initiates graceful close: sends FIN once any data still queued in
+    /// `send_pending` has actually been transmitted, rather than abandoning
+    /// it. If nothing is queued, the FIN goes out immediately (same as
+    /// before).
     pub fn close(&mut self, key: ConnectionKey, tun_fd: RawFd, trace: bool) {
         let Some(conn) = self.connections.get_mut(&key) else {
             return;
         };
         let old_state = conn.state;
         match conn.state {
-            TcpState::Established => {
-                queue_and_send(conn, tun_fd, TCP_FIN | TCP_ACK, &[], trace);
-                conn.state = TcpState::FinWait1;
-            }
-            TcpState::CloseWait => {
-                queue_and_send(conn, tun_fd, TCP_FIN | TCP_ACK, &[], trace);
-                conn.state = TcpState::LastAck;
+            TcpState::Established | TcpState::CloseWait => {
+                conn.pending_close = true;
+                flush_send(conn, tun_fd, trace);
             }
             TcpState::SynSent | TcpState::Listen => {
                 conn.state = TcpState::Closed;
