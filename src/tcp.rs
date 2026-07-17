@@ -167,6 +167,19 @@ pub struct TcpConnection {
 
     time_wait_deadline: Instant,
 
+    /// Armed when the peer's advertised window drops to 0 while we still
+    /// have unsent data — RFC 9293 §3.8.6.1's persist timer, so a lost
+    /// window-reopening ACK doesn't stall the connection forever. Cleared
+    /// once `process_ack` sees a nonzero window again.
+    probe_deadline: Option<Instant>,
+    probe_rto: Duration,
+
+    /// Set by `close()` when it's called while `send_pending` still has
+    /// undrained bytes: FIN is deferred (not sent immediately) so queued
+    /// app data isn't abandoned. `flush_send()` sends the FIN once
+    /// `send_pending` empties out.
+    pending_close: bool,
+
     pub(crate) recv_buffer_cap: usize,
     pub(crate) send_pending_cap: usize,
 }
@@ -227,8 +240,16 @@ fn generate_iss() -> u32 {
     rand::random()
 }
 
+/// Total bytes currently held for this connection's receiver side:
+/// in-order data awaiting an application read, plus whatever's sitting in
+/// the out-of-order reassembly buffer. Both count against `recv_buffer_cap`
+/// / SO_RCVBUF, or the cap doesn't actually bound memory under reordering.
+fn buffered_bytes(conn: &TcpConnection) -> usize {
+    conn.recv_buffer.len() + conn.ooo_buffer.values().map(|v| v.len()).sum::<usize>()
+}
+
 fn advertise_window(conn: &TcpConnection) -> u16 {
-    let used = conn.recv_buffer.len();
+    let used = buffered_bytes(conn);
     let cap = conn.recv_buffer_cap;
     if used >= cap {
         return 0;
@@ -400,8 +421,11 @@ fn receive_data_and_maybe_fin(
         }
     } else if seg.seq_num > conn.rcv_nxt {
         // Out of order: buffer any data and send a duplicate ACK
-        // advertising the byte we're actually still waiting for.
-        if !payload.is_empty() {
+        // advertising the byte we're actually still waiting for. Dropped
+        // (not buffered) if it would push us past recv_buffer_cap — mirrors
+        // UdpTable::deliver()'s cap check — the sender's own retransmit
+        // timer will retry once recv() drains room.
+        if !payload.is_empty() && buffered_bytes(conn) + payload.len() <= conn.recv_buffer_cap {
             conn.ooo_buffer.insert(seg.seq_num, payload.to_vec());
         }
         should_ack = true;
@@ -594,97 +618,104 @@ impl TcpTable {
 
         let old_state = conn.state;
 
-        match conn.state {
-            TcpState::SynSent => {
-                if seg.flags & TCP_RST != 0 {
-                    conn.state = TcpState::Closed;
-                } else if (seg.flags & TCP_SYN != 0) && (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
-                    conn.irs = seg.seq_num;
-                    conn.rcv_nxt = seg.seq_num.wrapping_add(1);
-                    conn.snd_una = seg.ack_num;
-                    conn.snd_wnd = seg.window as u32;
-                    remove_acked(conn, conn.snd_una);
-                    conn.state = TcpState::Established;
-                    send_ack_only(conn, tun_fd, trace);
+        // Uniform RST handling (RFC 9293 §3.10.7, general case): a RST in
+        // any live state aborts the connection to CLOSED. Hoisted above the
+        // per-state match so every post-handshake state gets this for free,
+        // not just SYN_SENT/SYN_RCVD (which used to check it individually).
+        // No sequence/ACK-number validation is added here — this preserves
+        // the same unconditional acceptance the old SYN_SENT/SYN_RCVD checks
+        // already had, just applied uniformly.
+        if seg.flags & TCP_RST != 0 && !matches!(conn.state, TcpState::Closed | TcpState::Listen) {
+            conn.state = TcpState::Closed;
+        } else {
+            match conn.state {
+                TcpState::SynSent => {
+                    if (seg.flags & TCP_SYN != 0) && (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
+                        conn.irs = seg.seq_num;
+                        conn.rcv_nxt = seg.seq_num.wrapping_add(1);
+                        conn.snd_una = seg.ack_num;
+                        conn.snd_wnd = seg.window as u32;
+                        remove_acked(conn, conn.snd_una);
+                        conn.state = TcpState::Established;
+                        send_ack_only(conn, tun_fd, trace);
+                    }
                 }
-            }
-            TcpState::SynRcvd => {
-                if seg.flags & TCP_RST != 0 {
-                    conn.state = TcpState::Closed;
-                } else if (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
-                    conn.snd_una = seg.ack_num;
-                    remove_acked(conn, conn.snd_una);
-                    conn.snd_wnd = seg.window as u32;
-                    conn.state = TcpState::Established;
-                    accept_queues
-                        .entry((conn.local_addr, conn.local_port))
-                        .or_default()
-                        .push_back(key);
-                    if !payload.is_empty() || (seg.flags & TCP_FIN != 0) {
-                        let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
-                        if fin {
-                            conn.state = TcpState::CloseWait;
+                TcpState::SynRcvd => {
+                    if (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
+                        conn.snd_una = seg.ack_num;
+                        remove_acked(conn, conn.snd_una);
+                        conn.snd_wnd = seg.window as u32;
+                        conn.state = TcpState::Established;
+                        accept_queues
+                            .entry((conn.local_addr, conn.local_port))
+                            .or_default()
+                            .push_back(key);
+                        if !payload.is_empty() || (seg.flags & TCP_FIN != 0) {
+                            let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
+                            if fin {
+                                conn.state = TcpState::CloseWait;
+                            }
                         }
                     }
                 }
-            }
-            TcpState::Established => {
-                process_ack(conn, seg);
-                let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
-                if fin {
-                    conn.state = TcpState::CloseWait;
+                TcpState::Established => {
+                    process_ack(conn, seg);
+                    let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
+                    if fin {
+                        conn.state = TcpState::CloseWait;
+                    }
+                    flush_send(conn, tun_fd, trace);
                 }
-                flush_send(conn, tun_fd, trace);
-            }
-            TcpState::FinWait1 => {
-                process_ack(conn, seg);
-                let our_fin_acked = (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt;
-                let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
-                if our_fin_acked && fin {
-                    conn.state = TcpState::TimeWait;
-                    conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
-                } else if our_fin_acked {
-                    conn.state = TcpState::FinWait2;
-                } else if fin {
-                    conn.state = TcpState::Closing;
+                TcpState::FinWait1 => {
+                    process_ack(conn, seg);
+                    let our_fin_acked = (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt;
+                    let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
+                    if our_fin_acked && fin {
+                        conn.state = TcpState::TimeWait;
+                        conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                    } else if our_fin_acked {
+                        conn.state = TcpState::FinWait2;
+                    } else if fin {
+                        conn.state = TcpState::Closing;
+                    }
                 }
-            }
-            TcpState::FinWait2 => {
-                process_ack(conn, seg);
-                let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
-                if fin {
-                    conn.state = TcpState::TimeWait;
-                    conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                TcpState::FinWait2 => {
+                    process_ack(conn, seg);
+                    let fin = receive_data_and_maybe_fin(conn, tun_fd, seg, payload, trace);
+                    if fin {
+                        conn.state = TcpState::TimeWait;
+                        conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                    }
                 }
-            }
-            TcpState::Closing => {
-                process_ack(conn, seg);
-                if (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
-                    conn.state = TcpState::TimeWait;
-                    conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                TcpState::Closing => {
+                    process_ack(conn, seg);
+                    if (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
+                        conn.state = TcpState::TimeWait;
+                        conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                    }
                 }
-            }
-            TcpState::CloseWait => {
-                process_ack(conn, seg);
-                flush_send(conn, tun_fd, trace);
-            }
-            TcpState::LastAck => {
-                process_ack(conn, seg);
-                if (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
-                    conn.state = TcpState::Closed;
+                TcpState::CloseWait => {
+                    process_ack(conn, seg);
+                    flush_send(conn, tun_fd, trace);
                 }
-            }
-            TcpState::TimeWait => {
-                // The whole point of TIME_WAIT: if our final ACK was
-                // lost, the remote retransmits its FIN. Re-ACK it (and
-                // restart the timer) instead of silently ignoring it,
-                // or the remote will retransmit until it gives up.
-                if seg.flags & TCP_FIN != 0 {
-                    send_ack_only(conn, tun_fd, trace);
-                    conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                TcpState::LastAck => {
+                    process_ack(conn, seg);
+                    if (seg.flags & TCP_ACK != 0) && seg.ack_num == conn.snd_nxt {
+                        conn.state = TcpState::Closed;
+                    }
                 }
+                TcpState::TimeWait => {
+                    // The whole point of TIME_WAIT: if our final ACK was
+                    // lost, the remote retransmits its FIN. Re-ACK it (and
+                    // restart the timer) instead of silently ignoring it,
+                    // or the remote will retransmit until it gives up.
+                    if seg.flags & TCP_FIN != 0 {
+                        send_ack_only(conn, tun_fd, trace);
+                        conn.time_wait_deadline = Instant::now() + TIME_WAIT_DURATION;
+                    }
+                }
+                TcpState::Closed | TcpState::Listen => {}
             }
-            TcpState::Closed | TcpState::Listen => {}
         }
 
         if trace && conn.state != old_state {
